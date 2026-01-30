@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import unicodedata
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Set, Any
 
 import pandas as pd
@@ -558,12 +559,27 @@ class EdinetLargeHoldingExtractor:
 class ScreeningPipeline:
     REQUIRED_SHEETS = ["Universe", "Market", "Fundamentals"]
 
-    def __init__(self, workbook: Path, outdir: Path, no_external: bool, refresh_cache: bool, log_level: str):
+    def __init__(
+        self,
+        workbook: Path,
+        outdir: Path,
+        no_external: bool,
+        refresh_cache: bool,
+        log_level: str,
+        watchlist_size: int,
+        max_history_runs: int,
+        report_only: bool,
+        snapshot_bucket_mode: str,
+    ):
         self.workbook = workbook
         self.outdir = outdir
         self.no_external = no_external
         self.refresh_cache = refresh_cache
         self.log_level = log_level
+        self.watchlist_size = watchlist_size
+        self.max_history_runs = max_history_runs
+        self.report_only = report_only
+        self.snapshot_bucket_mode = snapshot_bucket_mode
         self.io = ExcelIO(workbook)
         self.resolver = ColumnResolver()
         self.audit: Dict[str, Any] = {"run_at": datetime.now().isoformat()}
@@ -654,6 +670,8 @@ class ScreeningPipeline:
             "CATALYST_EDINET_MULTIPLIER": 1.0,
             "CATALYST_MAX": 15,
             "SCORE_MODE": "STRICT",
+            "SCORE_MOVE_THRESHOLD": 5,
+            "RANK_MOVE_THRESHOLD": 10,
             "TSE_PBR_PAGE_URL": "https://www.jpx.co.jp/equities/follow-up/02.html",
             "TSE_PBR_LIST_XLSX_URL": "",
             "EDINET_FORM_CODE_LIST_URL": "https://disclosure2dl.edinet-fsa.go.jp/guide/static/disclosure/download/ESE140327.xlsx",
@@ -672,6 +690,440 @@ class ScreeningPipeline:
         self.params = default_params
         self.cache_dir = Path(str(self.params.get("CACHE_DIR", "./data_cache")))
         self.audit["params"] = self.params
+
+    @staticmethod
+    def _run_id_now() -> str:
+        return datetime.now(tz=ZoneInfo("Asia/Tokyo")).isoformat()
+
+    @staticmethod
+    def _score_column(params: Dict[str, Any], df: pd.DataFrame) -> str:
+        if params.get("SCORE_MODE", "STRICT") != "STRICT" and "TotalScoreAdj" in df.columns:
+            return "TotalScoreAdj"
+        return "TotalScore"
+
+    @staticmethod
+    def _add_missing_fields(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        core_fields = ["PBR_used", "NetCashRatio", "RetainedEarningsRatio", "ADV20Value"]
+        available_fields = [col for col in core_fields if col in df.columns]
+        if not available_fields:
+            df["MissingCount"] = 0
+            df["MissingFields"] = ""
+            return df
+        missing_mask = df[available_fields].isna()
+        df["MissingCount"] = missing_mask.sum(axis=1)
+        df["MissingFields"] = missing_mask.apply(
+            lambda r: ",".join([col for col, missing in r.items() if missing]),
+            axis=1,
+        )
+        return df
+
+    @staticmethod
+    def _normalize_code_series(series: pd.Series) -> pd.Series:
+        def normalize(val):
+            if val is None or (isinstance(val, float) and pd.isna(val)) or val is pd.NA:
+                return pd.NA
+            text = str(val)
+            return text.zfill(4) if text.isdigit() else text
+        return series.apply(normalize)
+
+    def _load_snapshot_history(self, out_path: Path) -> pd.DataFrame:
+        if "Snapshot_History" in self.io.wb.sheetnames:
+            return pd.read_excel(self.workbook, sheet_name="Snapshot_History", engine="openpyxl")
+        if out_path.exists():
+            try:
+                return pd.read_excel(out_path, sheet_name="Snapshot_History", engine="openpyxl")
+            except ValueError:
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    def _trim_snapshot_history(self, history: pd.DataFrame) -> pd.DataFrame:
+        if history.empty or self.max_history_runs <= 0 or "run_id" not in history.columns:
+            return history
+        history = history.copy()
+        history["run_id_parsed"] = pd.to_datetime(history["run_id"], errors="coerce")
+        runs = (
+            history[["run_id", "run_id_parsed"]]
+            .dropna(subset=["run_id_parsed"])
+            .drop_duplicates()
+            .sort_values("run_id_parsed")
+        )
+        if len(runs) <= self.max_history_runs:
+            return history.drop(columns=["run_id_parsed"])
+        keep_runs = runs["run_id"].iloc[-self.max_history_runs :].tolist()
+        trimmed = history[history["run_id"].isin(keep_runs)].drop(columns=["run_id_parsed"])
+        return trimmed
+
+    def _select_watchlist(self, scores: pd.DataFrame) -> pd.DataFrame:
+        df = self._add_missing_fields(scores)
+        df["Code"] = self._normalize_code_series(df["Code"])
+        score_col = self._score_column(self.params, df)
+        confirmed = df[df["BaseScreenFlag"] == True].sort_values(score_col, ascending=False)  # noqa: E712
+        watchlist = confirmed.head(self.watchlist_size).copy()
+        watchlist["Bucket"] = "Confirmed"
+        remaining_slots = self.watchlist_size - len(watchlist)
+        if remaining_slots > 0:
+            unconfirmed_pool = df[df["BaseScreenFlag"].isna()].copy()
+            unconfirmed_pool = unconfirmed_pool.sort_values(["MissingCount", score_col], ascending=[True, False])
+            unconfirmed = unconfirmed_pool.head(remaining_slots).copy()
+            unconfirmed["Bucket"] = "Unconfirmed"
+            watchlist = pd.concat([watchlist, unconfirmed], ignore_index=True)
+        remaining_slots = self.watchlist_size - len(watchlist)
+        if remaining_slots > 0:
+            supplement_pool = df[df["BaseScreenFlag"] == False].copy()  # noqa: E712
+            supplement_pool = supplement_pool.sort_values(score_col, ascending=False)
+            supplement = supplement_pool.head(remaining_slots).copy()
+            if not supplement.empty:
+                supplement["Bucket"] = "Supplement"
+                watchlist = pd.concat([watchlist, supplement], ignore_index=True)
+        watchlist = watchlist.reset_index(drop=True)
+        watchlist.insert(0, "Rank", watchlist.index + 1)
+        return watchlist
+
+    def _select_watchlist_from_snapshot(self, snapshot: pd.DataFrame) -> pd.DataFrame:
+        if snapshot.empty:
+            return snapshot
+        df = snapshot.copy()
+        if "MissingCount" not in df.columns:
+            df = self._add_missing_fields(df)
+        df["Code"] = self._normalize_code_series(df["Code"])
+        score_col = self._score_column(self.params, df)
+        if "BaseScreenFlag" in df.columns:
+            confirmed = df[df["BaseScreenFlag"] == True].sort_values(score_col, ascending=False)  # noqa: E712
+            watchlist = confirmed.head(self.watchlist_size).copy()
+            watchlist["Bucket"] = "Confirmed"
+            remaining_slots = self.watchlist_size - len(watchlist)
+            if remaining_slots > 0:
+                unconfirmed_pool = df[df["BaseScreenFlag"].isna()].copy()
+                unconfirmed_pool = unconfirmed_pool.sort_values(["MissingCount", score_col], ascending=[True, False])
+                unconfirmed = unconfirmed_pool.head(remaining_slots).copy()
+                if not unconfirmed.empty:
+                    unconfirmed["Bucket"] = "Unconfirmed"
+                    watchlist = pd.concat([watchlist, unconfirmed], ignore_index=True)
+            remaining_slots = self.watchlist_size - len(watchlist)
+            if remaining_slots > 0:
+                supplement_pool = df[df["BaseScreenFlag"] == False].copy()  # noqa: E712
+                supplement_pool = supplement_pool.sort_values(score_col, ascending=False)
+                supplement = supplement_pool.head(remaining_slots).copy()
+                if not supplement.empty:
+                    supplement["Bucket"] = "Supplement"
+                    watchlist = pd.concat([watchlist, supplement], ignore_index=True)
+        elif "Bucket" in df.columns:
+            watchlist = df.copy()
+        else:
+            watchlist = df.sort_values(score_col, ascending=False).head(self.watchlist_size).copy()
+        watchlist = watchlist.reset_index(drop=True)
+        watchlist.insert(0, "Rank", watchlist.index + 1)
+        return watchlist
+
+    def _build_snapshot(self, df: pd.DataFrame, run_id: str, bucket_col: str = "Bucket") -> pd.DataFrame:
+        snapshot = self._add_missing_fields(df)
+        snapshot["run_id"] = run_id
+        if bucket_col not in snapshot.columns:
+            snapshot[bucket_col] = pd.NA
+        snapshot["Code"] = self._normalize_code_series(snapshot["Code"])
+        required_cols = [
+            "run_id",
+            "Rank",
+            "Code",
+            "Name",
+            "MarketSegment",
+            "Sector33",
+            "PBR_used",
+            "NetCash",
+            "NetCashRatio",
+            "RetainedEarningsRatio",
+            "ADV20Value",
+            "TSE_PBR_Status",
+            "TSE_PBR_EnglishFlag",
+            "TSE_PBR_InvestorContactFlag",
+            "EDINET_LH_Count_LB",
+            "EDINET_LH_LastSubmitDate",
+            "ValueScore",
+            "BalanceScore",
+            "LiquidityScore",
+            "CatalystScore",
+            "TotalScore",
+            "TotalScoreAdj",
+            "DataQualityPenalty",
+            "MissingCount",
+            "MissingFields",
+            "BaseScreenFlag",
+            bucket_col,
+        ]
+        cols = [col for col in required_cols if col in snapshot.columns]
+        return snapshot[cols].copy()
+
+    def _extract_prev_curr_runs(self, history: pd.DataFrame, curr_run_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+        if history.empty or "run_id" not in history.columns:
+            return pd.DataFrame(), pd.DataFrame(), None
+        history = history.copy()
+        history["run_id_parsed"] = pd.to_datetime(history["run_id"], errors="coerce")
+        runs = history[["run_id", "run_id_parsed"]].dropna().drop_duplicates().sort_values("run_id_parsed")
+        curr_idx = runs.index[runs["run_id"] == curr_run_id].tolist()
+        if not curr_idx:
+            return pd.DataFrame(), pd.DataFrame(), None
+        curr_pos = runs.index.get_loc(curr_idx[0])
+        prev_run_id = runs.iloc[curr_pos - 1]["run_id"] if curr_pos > 0 else None
+        curr_snapshot = history[history["run_id"] == curr_run_id].drop(columns=["run_id_parsed"])
+        prev_snapshot = history[history["run_id"] == prev_run_id].drop(columns=["run_id_parsed"]) if prev_run_id else pd.DataFrame()
+        return prev_snapshot, curr_snapshot, prev_run_id
+
+    def _build_new_signal_table(self, merged: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for _, row in merged.iterrows():
+            changes = []
+            if row.get("TSE_PBR_Status_prev") != "開示済" and row.get("TSE_PBR_Status_curr") == "開示済":
+                changes.append("TSE_PBR_Status:開示済")
+            if row.get("TSE_PBR_EnglishFlag_prev") != 1 and row.get("TSE_PBR_EnglishFlag_curr") == 1:
+                changes.append("TSE_PBR_EnglishFlag:1")
+            if row.get("TSE_PBR_InvestorContactFlag_prev") != 1 and row.get("TSE_PBR_InvestorContactFlag_curr") == 1:
+                changes.append("TSE_PBR_InvestorContactFlag:1")
+            prev_count = row.get("EDINET_LH_Count_LB_prev")
+            curr_count = row.get("EDINET_LH_Count_LB_curr")
+            if (pd.isna(prev_count) or prev_count < 1) and pd.notna(curr_count) and curr_count >= 1:
+                changes.append("EDINET_LH_Count_LB:>=1")
+            if changes:
+                rows.append(
+                    {
+                        "Code": row.get("Code"),
+                        "Name": row.get("Name_curr") or row.get("Name_prev"),
+                        "NewSignal": ";".join(changes),
+                        "EDINET_LH_LastSubmitDate": row.get("EDINET_LH_LastSubmitDate_curr"),
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def _compute_diff_data(
+        self,
+        prev_snapshot: pd.DataFrame,
+        curr_snapshot: pd.DataFrame,
+        prev_watchlist: pd.DataFrame,
+        curr_watchlist: pd.DataFrame,
+    ) -> Dict[str, pd.DataFrame]:
+        if prev_snapshot.empty or curr_snapshot.empty:
+            return {
+                "diff_sheet": pd.DataFrame([["前回スナップショットが無いため差分は作成されていません。"]], columns=["Notice"]),
+                "in_df": pd.DataFrame(),
+                "out_df": pd.DataFrame(),
+                "movers_up": pd.DataFrame(),
+                "movers_down": pd.DataFrame(),
+                "new_signal": pd.DataFrame(),
+            }
+        score_col = self._score_column(self.params, curr_snapshot)
+        prev_watch_codes = set(self._normalize_code_series(prev_watchlist["Code"]))
+        curr_watch_codes = set(self._normalize_code_series(curr_watchlist["Code"]))
+        in_codes = sorted(curr_watch_codes - prev_watch_codes)
+        out_codes = sorted(prev_watch_codes - curr_watch_codes)
+
+        prev_cols = prev_snapshot.add_suffix("_prev")
+        curr_cols = curr_snapshot.add_suffix("_curr")
+        merged = curr_cols.merge(prev_cols, left_on="Code_curr", right_on="Code_prev", how="left")
+        merged["Code"] = merged["Code_curr"]
+        merged["TotalScore_change"] = merged[f"{score_col}_curr"] - merged[f"{score_col}_prev"]
+        merged["CatalystScore_change"] = merged["CatalystScore_curr"] - merged["CatalystScore_prev"]
+        merged["Rank_change"] = merged["Rank_prev"] - merged["Rank_curr"]
+
+        in_df = merged[merged["Code"].isin(in_codes)].copy()
+        out_df = prev_snapshot[prev_snapshot["Code"].isin(out_codes)].copy()
+        in_df = in_df.assign(
+            Name=in_df["Name_curr"],
+            Rank=in_df["Rank_curr"],
+            TotalScoreUsed=in_df[f"{score_col}_curr"],
+            MissingFields=in_df["MissingFields_curr"],
+            BaseScreenFlagChange=in_df["BaseScreenFlag_prev"].astype(str) + "→" + in_df["BaseScreenFlag_curr"].astype(str),
+        )
+        out_df = out_df.assign(
+            Name=out_df["Name"],
+            Rank=out_df["Rank"],
+            TotalScoreUsed=out_df[score_col] if score_col in out_df.columns else out_df.get("TotalScore"),
+            MissingFields=out_df.get("MissingFields"),
+        )
+
+        movers = merged.dropna(subset=[f"{score_col}_curr", f"{score_col}_prev"]).copy()
+        movers["TotalScore_change"] = movers[f"{score_col}_curr"] - movers[f"{score_col}_prev"]
+        score_threshold = float(self.params.get("SCORE_MOVE_THRESHOLD", 5))
+        rank_threshold = float(self.params.get("RANK_MOVE_THRESHOLD", 10))
+        movers["Rank_change"] = movers["Rank_prev"] - movers["Rank_curr"]
+        focus_mask = movers["TotalScore_change"].abs().ge(score_threshold) | movers["Rank_change"].abs().ge(rank_threshold)
+        movers_focus = movers[focus_mask].copy()
+        movers_up = movers_focus.sort_values("TotalScore_change", ascending=False).head(10)
+        movers_down = movers_focus.sort_values("TotalScore_change", ascending=True).head(10)
+
+        new_signal = self._build_new_signal_table(merged)
+
+        rows: List[List[Any]] = []
+        rows.append(["IN (新規)"])
+        rows.append(["Code", "Name", "Rank", "TotalScore(Adj)", "MissingFields", "ScoreChange", "CatalystChange", "BaseScreenFlagChange"])
+        for _, row in in_df.iterrows():
+            rows.append(
+                [
+                    row.get("Code"),
+                    row.get("Name"),
+                    row.get("Rank"),
+                    row.get("TotalScoreUsed"),
+                    row.get("MissingFields"),
+                    row.get("TotalScore_change"),
+                    row.get("CatalystScore_change"),
+                    row.get("BaseScreenFlagChange"),
+                ]
+            )
+        rows.append([])
+        rows.append(["OUT (除外)"])
+        rows.append(["Code", "Name", "Rank", "TotalScore(Adj)", "MissingFields"])
+        for _, row in out_df.iterrows():
+            rows.append([row.get("Code"), row.get("Name"), row.get("Rank"), row.get("TotalScoreUsed"), row.get("MissingFields")])
+        rows.append([])
+        rows.append(["注目変化: 上昇 Top10"])
+        rows.append(["Code", "Name", "Rank_change", "TotalScore_change", "CatalystScore_change"])
+        for _, row in movers_up.iterrows():
+            rows.append(
+                [
+                    row.get("Code"),
+                    row.get("Name_curr"),
+                    row.get("Rank_change"),
+                    row.get("TotalScore_change"),
+                    row.get("CatalystScore_change"),
+                ]
+            )
+        rows.append([])
+        rows.append(["注目変化: 下落 Top10"])
+        rows.append(["Code", "Name", "Rank_change", "TotalScore_change", "CatalystScore_change"])
+        for _, row in movers_down.iterrows():
+            rows.append(
+                [
+                    row.get("Code"),
+                    row.get("Name_curr"),
+                    row.get("Rank_change"),
+                    row.get("TotalScore_change"),
+                    row.get("CatalystScore_change"),
+                ]
+            )
+        rows.append([])
+        rows.append(["NewSignal"])
+        rows.append(["Code", "Name", "NewSignal", "EDINET_LH_LastSubmitDate"])
+        for _, row in new_signal.iterrows():
+            rows.append([row.get("Code"), row.get("Name"), row.get("NewSignal"), row.get("EDINET_LH_LastSubmitDate")])
+
+        max_cols = max(len(r) for r in rows) if rows else 1
+        normalized_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+        columns = [f"col_{i+1}" for i in range(max_cols)]
+        diff_sheet = pd.DataFrame(normalized_rows, columns=columns)
+        return {
+            "diff_sheet": diff_sheet,
+            "in_df": in_df,
+            "out_df": out_df,
+            "movers_up": movers_up,
+            "movers_down": movers_down,
+            "movers_focus": movers_focus,
+            "new_signal": new_signal,
+        }
+
+    def _build_weekly_report(
+        self,
+        run_id: str,
+        confirmed: pd.DataFrame,
+        watchlist: pd.DataFrame,
+        diff_data: Dict[str, pd.DataFrame],
+        prev_exists: bool,
+        scores: Optional[pd.DataFrame],
+    ) -> pd.DataFrame:
+        diff_sheet = diff_data.get("diff_sheet", pd.DataFrame())
+        in_df = diff_data.get("in_df", pd.DataFrame())
+        out_df = diff_data.get("out_df", pd.DataFrame())
+        new_signal = diff_data.get("new_signal", pd.DataFrame())
+        rows: List[List[Any]] = []
+        rows.append(["Weekly Report"])
+        rows.append(["run_id", run_id])
+        rows.append(["SCORE_MODE", self.params.get("SCORE_MODE")])
+        rows.append([
+            "Filters",
+            f"PBR_threshold={self.params.get('PBR_threshold')}, ADV20Value_min={self.params.get('ADV20Value_min')}, lookback_days={self.params.get('LOOKBACK_DAYS_EDINET')}",
+        ])
+        rows.append([])
+        rows.append(["Summary"])
+        if scores is not None and "BaseScreenFlag" in scores.columns:
+            base_counts = scores["BaseScreenFlag"].value_counts(dropna=False).to_dict()
+            rows.append(["- BaseScreen True/False/NA", json.dumps(base_counts, ensure_ascii=False)])
+        else:
+            rows.append(["- BaseScreen True/False/NA", "N/A (report-only)"])
+        rows.append(["- Confirmed Top20 count", len(confirmed)])
+        if prev_exists:
+            rows.append(["- IN count", len(in_df)])
+            rows.append(["- OUT count", len(out_df)])
+        else:
+            rows.append(["- IN/OUT", "前回なし"])
+        movers_focus = diff_data.get("movers_focus", pd.DataFrame())
+        rows.append(["- 注目変化", len(movers_focus)])
+        rows.append(["- 外部シグナル新規", len(new_signal)])
+        missing_top = self.audit.get("derived_missing_top")
+        if missing_top:
+            rows.append(["- 欠損が多い上位フィールド", json.dumps(missing_top, ensure_ascii=False)])
+        else:
+            rows.append(["- 欠損が多い上位フィールド", "N/A"])
+        external_status = self._external_status() if scores is not None else "NA"
+        if external_status in {"FAILED", "PARTIAL"}:
+            rows.append(["- 注記", "外部取得が不完全のため新規シグナル検知は不完全です。"])
+        rows.append([])
+
+        rows.append(["Confirmed Top20"])
+        rows.append(["Rank", "Code", "Name", "PBR_used", "NetCashRatio", "RetEarnRatio", "ADV20Value", "Catalyst", "Total"])
+        for _, row in confirmed.iterrows():
+            rows.append(
+                [
+                    row.get("Rank"),
+                    row.get("Code"),
+                    row.get("Name"),
+                    row.get("PBR_used"),
+                    row.get("NetCashRatio"),
+                    row.get("RetainedEarningsRatio"),
+                    row.get("ADV20Value"),
+                    row.get("CatalystScore"),
+                    row.get("TotalScoreAdj") if "TotalScoreAdj" in row.index else row.get("TotalScore"),
+                ]
+            )
+
+        rows.append([])
+        rows.append(["IN/OUT List"])
+        rows.append(["Code", "Name", "prev_rank", "curr_rank", "TotalScore_change", "NewSignal"])
+        if prev_exists:
+            new_signal_codes = set(new_signal["Code"]) if not new_signal.empty else set()
+            for _, row in in_df.iterrows():
+                rows.append(
+                    [
+                        row.get("Code"),
+                        row.get("Name"),
+                        "",
+                        row.get("Rank"),
+                        row.get("TotalScore_change"),
+                        "Yes" if row.get("Code") in new_signal_codes else "",
+                    ]
+                )
+            for _, row in out_df.iterrows():
+                rows.append(
+                    [
+                        row.get("Code"),
+                        row.get("Name"),
+                        row.get("Rank"),
+                        "",
+                        "",
+                        "Yes" if row.get("Code") in new_signal_codes else "",
+                    ]
+                )
+        else:
+            rows.append(["前回なし"])
+
+        if not new_signal.empty:
+            rows.append([])
+            rows.append(["NewSignal"])
+            rows.append(["Code", "Name", "Signal", "EDINET_LH_LastSubmitDate"])
+            for _, row in new_signal.iterrows():
+                rows.append([row.get("Code"), row.get("Name"), row.get("NewSignal"), row.get("EDINET_LH_LastSubmitDate")])
+
+        max_cols = max(len(r) for r in rows) if rows else 1
+        normalized_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+        columns = [f"col_{i+1}" for i in range(max_cols)]
+        return pd.DataFrame(normalized_rows, columns=columns)
 
     # ------------------------ external ------------------------
     def run_external(self):
@@ -944,21 +1396,46 @@ class ScreeningPipeline:
         return confirmed, unconf
 
     # ------------------------ output writing ------------------------
-    def write_outputs(self, derived: pd.DataFrame, scores: pd.DataFrame, confirmed: pd.DataFrame, unconf: pd.DataFrame):
+    def write_outputs(
+        self,
+        derived: Optional[pd.DataFrame],
+        scores: Optional[pd.DataFrame],
+        confirmed: Optional[pd.DataFrame],
+        unconf: Optional[pd.DataFrame],
+        watchlist: pd.DataFrame,
+        snapshot: pd.DataFrame,
+        history: pd.DataFrame,
+        diff_sheet: pd.DataFrame,
+        weekly_report: pd.DataFrame,
+    ):
         # ensure outdir exists
         self.outdir.mkdir(parents=True, exist_ok=True)
         out_name = self.workbook.stem + "_out.xlsx"
         out_path = self.outdir / out_name
-        if out_path.exists():
-            raise FileExistsError(f"Output file already exists: {out_path}")
         # replace sheets
         self.io.replace_sheet_with_df("Params", pd.DataFrame(list(self.params.items()), columns=["Param", "Value"]))
-        self.io.replace_sheet_with_df("TSE_PBR_List", self.external_data.get("TSE", pd.DataFrame(columns=TSEListNormalizer.REQUIRED_COLS)))
-        self.io.replace_sheet_with_df("EDINET_LargeHolding", self.external_data.get("EDINET", pd.DataFrame(columns=EdinetLargeHoldingExtractor.REQUIRED_COLS)))
-        self.io.replace_sheet_with_df("Derived", derived)
-        self.io.replace_sheet_with_df("Scores", scores)
-        candidates_combined = pd.concat([confirmed.assign(Category="Confirmed"), unconf.assign(Category="Unconfirmed")], ignore_index=True)
-        self.io.replace_sheet_with_df("Candidates", candidates_combined)
+        if derived is not None:
+            self.io.replace_sheet_with_df("Derived", derived)
+        if scores is not None:
+            self.io.replace_sheet_with_df("Scores", scores)
+        if confirmed is not None and unconf is not None:
+            candidates_combined = pd.concat(
+                [confirmed.assign(Category="Confirmed"), unconf.assign(Category="Unconfirmed")], ignore_index=True
+            )
+            self.io.replace_sheet_with_df("Candidates", candidates_combined)
+        if self.external_data:
+            self.io.replace_sheet_with_df(
+                "TSE_PBR_List", self.external_data.get("TSE", pd.DataFrame(columns=TSEListNormalizer.REQUIRED_COLS))
+            )
+            self.io.replace_sheet_with_df(
+                "EDINET_LargeHolding",
+                self.external_data.get("EDINET", pd.DataFrame(columns=EdinetLargeHoldingExtractor.REQUIRED_COLS)),
+            )
+        self.io.replace_sheet_with_df("Watchlist", watchlist)
+        self.io.replace_sheet_with_df("Candidates_Snapshot", snapshot)
+        self.io.replace_sheet_with_df("Snapshot_History", history)
+        self.io.replace_sheet_with_df("Diff", diff_sheet)
+        self.io.replace_sheet_with_df("Weekly_Report", weekly_report)
         self.write_audit()
         self.io.save(out_path)
         self.out_path = out_path
@@ -984,10 +1461,47 @@ class ScreeningPipeline:
 
     # ------------------------ run ------------------------
     def run(self):
-        logging.info("Loading inputs")
-        dfs = self.load_inputs()
         logging.info("Loading params")
         self.load_params()
+        out_name = self.workbook.stem + "_out.xlsx"
+        out_path = self.outdir / out_name
+        history = self._load_snapshot_history(out_path)
+        if self.report_only:
+            if history.empty:
+                run_id = self._run_id_now()
+                watchlist = pd.DataFrame()
+                snapshot = pd.DataFrame()
+                diff_data = {"diff_sheet": pd.DataFrame([["前回なし"]], columns=["Notice"]), "new_signal": pd.DataFrame()}
+                weekly_report = self._build_weekly_report(
+                    run_id=run_id,
+                    confirmed=pd.DataFrame(),
+                    watchlist=watchlist,
+                    diff_data=diff_data,
+                    prev_exists=False,
+                    scores=None,
+                )
+                self.write_outputs(None, None, None, None, watchlist, snapshot, history, diff_data["diff_sheet"], weekly_report)
+                return
+            history["run_id_parsed"] = pd.to_datetime(history["run_id"], errors="coerce")
+            latest_run = history.dropna(subset=["run_id_parsed"]).sort_values("run_id_parsed").iloc[-1]["run_id"]
+            prev_snapshot, curr_snapshot, prev_run_id = self._extract_prev_curr_runs(history, latest_run)
+            watchlist = self._select_watchlist_from_snapshot(curr_snapshot)
+            prev_watchlist = self._select_watchlist_from_snapshot(prev_snapshot) if not prev_snapshot.empty else pd.DataFrame()
+            diff_data = self._compute_diff_data(prev_snapshot, curr_snapshot, prev_watchlist, watchlist)
+            weekly_report = self._build_weekly_report(
+                run_id=latest_run,
+                confirmed=pd.DataFrame(),
+                watchlist=watchlist,
+                diff_data=diff_data,
+                prev_exists=prev_run_id is not None,
+                scores=None,
+            )
+            history = history.drop(columns=["run_id_parsed"])
+            self.write_outputs(None, None, None, None, watchlist, curr_snapshot, history, diff_data["diff_sheet"], weekly_report)
+            return
+
+        logging.info("Loading inputs")
+        dfs = self.load_inputs()
         logging.info("Running external fetches")
         self.run_external()
         logging.info("Building derived")
@@ -996,8 +1510,34 @@ class ScreeningPipeline:
         scores = self.build_scores(derived)
         logging.info("Building candidates")
         confirmed, unconf = self.build_candidates(scores)
+        watchlist = self._select_watchlist(scores)
+        run_id = self._run_id_now()
+        if self.snapshot_bucket_mode.upper() == "WATCHLIST":
+            snapshot_source = watchlist.copy()
+        else:
+            snapshot_source = pd.concat(
+                [
+                    confirmed.assign(Bucket="Confirmed"),
+                    unconf.assign(Bucket="Unconfirmed"),
+                ],
+                ignore_index=True,
+            )
+        snapshot = self._build_snapshot(snapshot_source, run_id=run_id)
+        history = pd.concat([history, snapshot], ignore_index=True) if not history.empty else snapshot.copy()
+        history = self._trim_snapshot_history(history)
+        prev_snapshot, curr_snapshot, prev_run_id = self._extract_prev_curr_runs(history, run_id)
+        prev_watchlist = self._select_watchlist_from_snapshot(prev_snapshot) if not prev_snapshot.empty else pd.DataFrame()
+        diff_data = self._compute_diff_data(prev_snapshot, curr_snapshot, prev_watchlist, watchlist)
+        weekly_report = self._build_weekly_report(
+            run_id=run_id,
+            confirmed=confirmed,
+            watchlist=watchlist,
+            diff_data=diff_data,
+            prev_exists=prev_run_id is not None,
+            scores=scores,
+        )
         logging.info("Writing outputs")
-        self.write_outputs(derived, scores, confirmed, unconf)
+        self.write_outputs(derived, scores, confirmed, unconf, watchlist, snapshot, history, diff_data["diff_sheet"], weekly_report)
 
         # stdout summaries
         base_counts = derived["BaseScreenFlag"].value_counts(dropna=False).to_dict()
@@ -1021,6 +1561,15 @@ def main():
     parser.add_argument("--outdir", default="./out", help="Output directory")
     parser.add_argument("--no-external", action="store_true", help="Skip external fetches")
     parser.add_argument("--refresh-cache", action="store_true", help="Refresh cache")
+    parser.add_argument("--watchlist-size", type=int, default=30, help="Watchlist size (default 30)")
+    parser.add_argument("--max-history-runs", type=int, default=52, help="Max snapshot history runs to keep")
+    parser.add_argument("--report-only", action="store_true", help="Regenerate report/diff from Snapshot_History")
+    parser.add_argument(
+        "--snapshot-bucket-mode",
+        default="CANDIDATES",
+        choices=["WATCHLIST", "CANDIDATES"],
+        help="Snapshot scope: WATCHLIST or CANDIDATES",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Log level")
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
@@ -1031,6 +1580,10 @@ def main():
         no_external=args.no_external,
         refresh_cache=args.refresh_cache,
         log_level=args.log_level,
+        watchlist_size=args.watchlist_size,
+        max_history_runs=args.max_history_runs,
+        report_only=args.report_only,
+        snapshot_bucket_mode=args.snapshot_bucket_mode,
     )
     pipeline.run()
 
