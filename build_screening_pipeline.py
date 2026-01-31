@@ -1019,6 +1019,15 @@ class ScreeningPipeline:
             "new_signal": new_signal,
         }
 
+    def _confirmed_from_snapshot(self, snapshot: pd.DataFrame) -> pd.DataFrame:
+        if snapshot.empty or "BaseScreenFlag" not in snapshot.columns:
+            return pd.DataFrame()
+        score_col = self._score_column(self.params, snapshot)
+        confirmed = snapshot[snapshot["BaseScreenFlag"] == True].copy()  # noqa: E712
+        confirmed = confirmed.sort_values(score_col, ascending=False).head(20).reset_index(drop=True)
+        confirmed.insert(0, "Rank", confirmed.index + 1)
+        return confirmed
+
     def _build_weekly_report(
         self,
         run_id: str,
@@ -1058,7 +1067,7 @@ class ScreeningPipeline:
         rows.append(["- 外部シグナル新規", len(new_signal)])
         missing_top = self.audit.get("derived_missing_top")
         if missing_top:
-            rows.append(["- 欠損が多い上位フィールド", json.dumps(missing_top, ensure_ascii=False)])
+            rows.append(["- 欠損が多い上位フィールド", f"{json.dumps(missing_top, ensure_ascii=False)} (欠損は未確認)"])
         else:
             rows.append(["- 欠損が多い上位フィールド", "N/A"])
         external_status = self._external_status() if scores is not None else "NA"
@@ -1488,9 +1497,10 @@ class ScreeningPipeline:
             watchlist = self._select_watchlist_from_snapshot(curr_snapshot)
             prev_watchlist = self._select_watchlist_from_snapshot(prev_snapshot) if not prev_snapshot.empty else pd.DataFrame()
             diff_data = self._compute_diff_data(prev_snapshot, curr_snapshot, prev_watchlist, watchlist)
+            confirmed_snapshot = self._confirmed_from_snapshot(curr_snapshot)
             weekly_report = self._build_weekly_report(
                 run_id=latest_run,
-                confirmed=pd.DataFrame(),
+                confirmed=confirmed_snapshot,
                 watchlist=watchlist,
                 diff_data=diff_data,
                 prev_exists=prev_run_id is not None,
